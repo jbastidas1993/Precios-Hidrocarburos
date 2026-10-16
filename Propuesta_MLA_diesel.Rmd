@@ -1,0 +1,1466 @@
+---
+title: "Propuesta: Mecanismo Logarítmico Amortiguado (MLA) – diésel premium"
+subtitle: "Alternativa a la banda del DE 126 y al mecanismo excepcional de los DE 444/468"
+author: "Proyecto: fijación de precios de combustibles en Ecuador"
+date: "`r paste(as.integer(format(Sys.Date(), '%d')), 'de', c('enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre')[as.integer(format(Sys.Date(), '%m'))], 'de', format(Sys.Date(), '%Y'))`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    df_print: kable
+params:
+  # --- Datos reales (opcional). Dejar "" para usar sólo escenarios sintéticos ---
+  archivo_datos: ""          # ruta a CSV o XLSX (diario o mensual)
+  col_fecha: "fecha"
+  col_valor: "wti"
+  tipo_valor: "wti"          # "wti" (USD/bbl) o "paridad" (PPImgn, USD/gal)
+  # --- Paridad aproximada desde el WTI ---
+  S: 2.60                    # paridad PPImgn cuando WTI = WTI de referencia (USD/gal sin IVA)
+  rezago: 2                  # meses entre WTI y paridad
+  elasticidad: 1.0
+  # --- Punto de partida y PVP ---
+  pvp0: 2.80                 # PVP transitorio DE 126 (USD/gal con IVA)
+  iva: 0.15
+  mgc: 0.128438
+  precio_base: 2.229421
+  # --- Parámetros MLA ---
+  h: 9                       # vida media de la referencia (meses)
+  theta: 0.20                # escala de compresión logarítmica (alzas)
+  theta_baja: 0.0            # 0 = bajas sin compresión; >0 = fondo de estabilización
+  lambda: 0.50               # velocidad de ajuste
+  c_up: 0.04                 # techo suave de alza mensual
+  c_down: 0.08               # techo suave de baja mensual
+  kappa: 0.25                # fatiga logarítmica por alzas consecutivas
+  coherencia: true           # no subir si la paridad baja
+  # --- Banda DE 126 / excepcional ---
+  lim_sup: 0.05
+  lim_inf: -0.10
+  una_sola_vez: true
+  exportar_csv: false
+  # --- Calibración con la serie real (sección 12) ---
+  archivo_calibracion: "../BASE_FINAL_WTI_BRENT.xlsx"   # también se busca junto al Rmd y en datos/
+  S_pvp: 2.905               # paridad equivalente a PVP con el WTI del mes de referencia (ejercicio validado)
+  mes_ref: "2025-09"
+  theta_percentil: 0.90      # θ = percentil del exceso positivo histórico
+  fraccion_peor_banda: 0.50  # κ tal que el peor alza en 12 meses sea esta fracción del de la banda
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 4.6, dpi = 120, fig.align = "center")
+paquetes <- c("ggplot2", "knitr", "plotly", "htmltools")
+faltan <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltan)) install.packages(faltan, repos = "https://cloud.r-project.org")
+library(ggplot2)
+library(knitr)
+library(plotly)
+library(htmltools)
+
+p <- params
+COL <- c("Paridad" = "#dc2626", "Banda DE 126" = "#d97706",
+         "Vigente DE 444/468" = "#2563eb", "Logarítmico (MLA)" = "#059669",
+         "Referencia R" = "#6b7280", "Objetivo T" = "#a855f7")
+tema <- theme_minimal(base_size = 9.5) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 11),
+        legend.text = element_text(size = 8.5), axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8.5),
+        panel.grid.minor = element_blank())
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d, big.mark = ".", decimal.mark = ",")
+
+# ---- Estilo común de los gráficos interactivos (plotly) ----
+estilo_plotly <- function(pl, titulo = NULL, xt = NULL, yt = NULL, hover = "x unified",
+                          leyenda = c("abajo", "arriba")) {
+  leyenda <- match.arg(leyenda)
+  pos <- if (leyenda == "abajo") list(orientation = "h", x = 0, y = -0.2)
+         else list(orientation = "h", x = 0, y = 1.01, yanchor = "bottom")
+  pl %>%
+    layout(title = list(text = paste0("<b>", titulo, "</b>"), font = list(size = 13),
+                        x = 0.01, xanchor = "left", y = 0.98, yref = "container", yanchor = "top"),
+           xaxis = list(title = xt, gridcolor = "#eeeeee", zeroline = FALSE),
+           yaxis = list(title = yt, gridcolor = "#eeeeee", zeroline = FALSE),
+           legend = c(pos, list(font = list(size = 11))),
+           hovermode = hover, separators = ",.", font = list(size = 11),
+           margin = list(t = if (leyenda == "arriba") 95 else 50, b = 10, l = 60, r = 60)) %>%
+    config(locale = "es", displaylogo = FALSE,
+           modeBarButtonsToRemove = c("lasso2d", "select2d", "autoScale2d"))
+}
+linea_h <- function(y, color = "#7c3aed", dash = "dot")
+  list(type = "line", xref = "paper", x0 = 0, x1 = 1, y0 = y, y1 = y,
+       line = list(color = color, dash = dash, width = 1.2))
+# Al abrir el documento, muestra el cuadro del deslizador que corresponde a los parámetros
+iniciar_en <- function(pl, cuadro) {
+  htmlwidgets::onRender(pl, sprintf(
+    "function(el) { Plotly.animate(el, ['%s'], {mode: 'immediate', frame: {duration: 0, redraw: false}, transition: {duration: 0}}); }",
+    cuadro))
+}
+tabla_html <- function(x, caption = NULL, ...)
+  HTML(as.character(kable(x, format = "html", caption = caption,
+                          table.attr = 'class="table table-condensed"', ...)))
+```
+
+```{css estilos, echo=FALSE}
+/* Tipografía más compacta */
+body { font-size: 13.5px; line-height: 1.55; }
+.main-container { max-width: 1100px; }
+h1.title { font-size: 26px; }
+h3.subtitle, h4.author, h4.date { font-size: 14px; font-weight: 400; }
+h1 { font-size: 21px; margin-top: 30px; }
+h2 { font-size: 17px; margin-top: 22px; }
+h3 { font-size: 15px; }
+p, li { font-size: 13.5px; }
+table, .table { font-size: 12px; }
+.table > thead > tr > th, .table > tbody > tr > td { padding: 4px 8px; }
+caption { font-size: 12px; color: #6b7280; }
+pre, pre code, code { font-size: 11.5px; }
+.tocify { font-size: 12.5px; }
+.tocify-subheader > .tocify-item { font-size: 12px; }
+.btn { font-size: 11px; padding: 2px 8px; }
+mjx-container, .MathJax { font-size: 92% !important; }
+/* Ecuaciones en bloque: más aire arriba y abajo */
+.math.display, mjx-container[display="true"], .MathJax_Display {
+  margin: 10px 0 18px 0 !important; padding: 6px 0; }
+p > strong:only-child { display: inline-block; margin-top: 8px; }
+img { max-width: 92%; }
+```
+
+# Resumen
+
+El Decreto Ejecutivo 126 (12-sep-2025) eliminó el subsidio generalizado al diésel premium y fijó
+un **mecanismo de estabilización por bandas**: el precio en terminal (PT) se mueve cada mes hacia
+la paridad de importación con margen (PPImgn), pero la variación se recorta a **+5 %** al alza y
+**−10 %** a la baja, con un piso de 2,229421 USD/gal sin IVA.
+
+Esa banda tiene dos problemas. Ante alzas prolongadas del crudo produce **subidas encadenadas al
+tope** (+5 % mes tras mes, hasta +80 % en un año). Y cuando la paridad cae después de un pico, pero
+sigue por encima del PT, **el precio sigue subiendo** aunque el mercado baje. Los DE 444 y 468
+corrigieron lo segundo con un mecanismo excepcional de recortes forzados que se activa con
+umbrales.
+
+Este documento propone el **Mecanismo Logarítmico Amortiguado (MLA)**. Sus rasgos son:
+
+- El precio sigue a la paridad, pero el **exceso sobre un precio de largo plazo se comprime con
+  una función logarítmica**: cada punto adicional de alza se traslada menos que el anterior.
+- El ajuste mensual es **continuo y acotado** (tangente hiperbólica), sin meses «al tope» ni
+  umbrales que encienden y apagan reglas.
+- Ante **alzas prolongadas** el techo mensual se reduce de forma logarítmica con la duración de la
+  racha.
+- El precio **no sube en un mes en que la paridad baja**.
+
+El costo de suavizar es una brecha temporal con la paridad. El documento la cuantifica y muestra
+cómo regularla con los parámetros.
+
+# Fórmula vigente: banda del DE 126
+
+**1. Paridad de importación sin margen**
+
+$$
+\mathrm{PPI}_n = \mathrm{PM} + \mathrm{Flete} + \mathrm{Seguro} + \mathrm{CuI}_n + \mathrm{Cf}_{n-1}
+$$
+
+$$
+\mathrm{Seguro} = (\mathrm{PM} + \mathrm{Flete}) \times 0{,}05\,\%
+$$
+
+**2. Paridad con margen de abastecedora** ($Rt_n$ = rendimiento del bono del Tesoro a 10 años)
+
+$$
+\mathrm{PPI}_{mg,n} = \mathrm{PPI}_n \,(1 + Rt_n)
+$$
+
+**3. Variación teórica y banda**
+
+$$
+a = \frac{\mathrm{PPI}_{mg,n}}{\mathrm{PT}_{n-1}} - 1
+\qquad\longrightarrow\qquad
+a^{*} = \min\bigl\{\max\{a,\ -10\,\%\},\ +5\,\%\bigr\}
+$$
+
+**4. Precio en terminal, con piso en el precio base**
+
+$$
+\mathrm{PT}_n = \max\bigl\{\mathrm{PT}_{n-1}\,(1 + a^{*}),\ \ 2{,}229421\bigr\}
+$$
+
+**5. Precio de venta al público** (redondeado al tercer decimal hacia arriba)
+
+$$
+\mathrm{PVP}_n = \bigl(\mathrm{PT}_n + 0{,}128438\bigr)\,(1 + \mathrm{IVA})
+$$
+
+El **mecanismo excepcional** (DE 444 modificado por DE 468) se activa cuando, a la vez, la paridad
+cae al menos 15 % en dos meses, había subido al menos 50 % en los tres meses previos y el PT viene
+de dos alzas al tope. Mientras está activo, el PT baja $\alpha$ = 0,75 % → 1,00 % → 1,25 % → 1,50 %
+por mes. Sale si la paridad queda por debajo del PT, si la paridad sube al menos 40 % en cuatro
+meses o si el PT toca el precio base.
+
+# Propuesta: Mecanismo Logarítmico Amortiguado
+
+Sea $P_n$ la paridad PPImgn del período $n$. Todo el cálculo se hace en logaritmos.
+
+**(1) Referencia de largo plazo** (media móvil exponencial en logaritmos, vida media $h$)
+
+$$
+\ln R_n = \ln R_{n-1} + w\,\bigl(\ln P_n - \ln R_{n-1}\bigr),
+\qquad w = 1 - 0{,}5^{\,1/h}
+$$
+
+**(2) Exceso de la paridad sobre la referencia**
+
+$$
+X_n = \ln\!\left(\frac{P_n}{R_n}\right)
+$$
+
+**(3) Compresión logarítmica del exceso**
+
+$$
+Y_n =
+\begin{cases}
+\theta\,\ln\!\left(1 + \dfrac{X_n}{\theta}\right) & \text{si } X_n > 0\\[10pt]
+X_n & \text{si } X_n \le 0
+\end{cases}
+$$
+
+**(4) Precio objetivo**
+
+$$
+T_n = R_n\, e^{\,Y_n}
+$$
+
+**(5) Brecha a cerrar**
+
+$$
+G_n = \ln\!\left(\frac{T_n}{\mathrm{PT}_{n-1}}\right)
+$$
+
+**(6) Fatiga logarítmica** ($m_n$ = meses seguidos de alza del PT)
+
+$$
+c_n = \frac{c_\uparrow}{1 + \kappa\,\ln(1 + m_n)}
+$$
+
+**(7) Paso mensual suave y acotado**
+
+$$
+d_n =
+\begin{cases}
+c_n \tanh\!\left(\dfrac{\lambda\, G_n}{c_n}\right) & \text{si } G_n > 0\\[14pt]
+c_\downarrow \tanh\!\left(\dfrac{\lambda\, G_n}{c_\downarrow}\right) & \text{si } G_n \le 0
+\end{cases}
+$$
+
+**(8) Coherencia direccional**
+
+$$
+P_n < P_{n-1} \;\Longrightarrow\; d_n \le 0
+$$
+
+**(9) Precio en terminal, con piso en el precio base**
+
+$$
+\mathrm{PT}_n = \max\bigl\{\mathrm{PT}_{n-1}\, e^{\,d_n},\ \ 2{,}229421\bigr\}
+$$
+
+El PVP se calcula igual que en el DE 126. Como opción, las bajas también pueden comprimirse
+($Y_n = -\theta_b \ln(1 + |X_n|/\theta_b)$ si $X_n \le 0$). Esa variante funciona como un fondo de
+estabilización: cuando el crudo cae, el precio queda algo por encima de la paridad y se recupera
+parte del costo.
+
+```{r parametros}
+kable(data.frame(
+  Parametro = c("Vida media de la referencia h", "θ compresión (alzas)", "θ_b compresión (bajas)",
+                "λ velocidad de ajuste", "c↑ techo suave de alza", "c↓ techo suave de baja",
+                "κ fatiga logarítmica", "Coherencia direccional", "Precio base"),
+  Valor = c(paste(p$h, "meses"), p$theta, ifelse(p$theta_baja > 0, p$theta_baja, "0 (sin compresión)"),
+            p$lambda, paste0(p$c_up * 100, " %"), paste0(p$c_down * 100, " %"), p$kappa,
+            ifelse(p$coherencia, "Sí", "No"), p$precio_base)),
+  col.names = c("Parámetro", "Valor"), caption = "Parámetros usados en este documento (editables en el encabezado YAML)")
+```
+
+# Justificación de la fórmula
+
+## Por qué logaritmos
+
+El precio del crudo se comporta aproximadamente como un proceso log-normal: lo relevante son sus
+variaciones relativas. En logaritmos, una subida de 50 % y la bajada de 33 % que la deshace miden
+lo mismo ($\pm 0{,}405$); las variaciones de varios meses se suman; y la regla no depende del nivel
+del precio. La banda del DE 126 ya es multiplicativa ($PT_n = PT_{n-1}(1+a)$); el MLA lo hace
+explícito y consistente.
+
+## Por qué $Y = \theta\ln(1 + X/\theta)$
+
+Es la función más simple que cumple a la vez cuatro condiciones deseables:
+
+| Propiedad | Expresión | Consecuencia |
+|---|---|---|
+| Neutral en tiempos normales | $Y(0)=0,\ Y'(0)=1$ | Movimientos pequeños pasan casi uno a uno; no se distorsiona la señal de precio. |
+| Traspaso marginal decreciente | $Y'(X)=\dfrac{\theta}{\theta+X}$, $\ Y''(X)=-\dfrac{\theta}{(\theta+X)^2}<0$ | Cada punto adicional de alza se traslada menos. Con $X=\theta$ el traspaso marginal es 50 %. |
+| No explosiva | $\lim_{X\to\infty} Y/X = 0$; $\ Y$ crece como $\ln X$ | Duplicar el alza internacional no duplica el alza interna. |
+| Interpretable | un solo parámetro $\theta$ | $\theta$ = exceso a partir del cual el consumidor absorbe menos de la mitad del alza adicional. |
+
+Mueve el deslizador **θ** para ver cómo cambia la compresión. Pasa el cursor sobre las curvas para
+leer los valores.
+
+```{r compresor}
+compresor <- function(x, th) ifelse(x > 0, th * log1p(pmax(x, 0) / th), x)
+thetas <- sort(unique(round(c(0.05, 0.10, 0.15, 0.20, 0.30, 0.45, 0.60, 0.80, 1.00, p$theta), 2)))
+xs <- seq(-0.4, 1.2, length.out = 161)
+df_c <- do.call(rbind, lapply(thetas, function(th)
+  data.frame(x = expm1(xs) * 100, y = expm1(compresor(xs, th)) * 100,
+             theta = sprintf("%.2f", th))))
+lin <- data.frame(x = expm1(xs) * 100, y = expm1(xs) * 100)
+
+plot_ly(height = 460) %>%
+  add_lines(data = lin, x = ~x, y = ~y, name = "Traspaso total (sin regla)",
+            line = list(color = "#9ca3af", dash = "dot", width = 2),
+            hovertemplate = "Sin regla: +%{y:.1f} %<extra></extra>") %>%
+  add_lines(data = df_c, x = ~x, y = ~y, frame = ~theta, name = "MLA: θ·ln(1 + X/θ)",
+            line = list(color = "#059669", width = 3.5),
+            hovertemplate = "MLA: %{y:+.1f} %<extra></extra>") %>%
+  estilo_plotly("Compresión logarítmica del exceso",
+                "Paridad sobre su referencia (%)", "Precio objetivo sobre la referencia (%)") %>%
+  animation_opts(frame = 0, transition = 0, redraw = FALSE) %>%
+  animation_slider(active = which(thetas == round(p$theta, 2)) - 1,
+                   currentvalue = list(prefix = "θ = ", font = list(size = 12, color = "#111827")),
+                   pad = list(t = 55)) %>%
+  animation_button(visible = FALSE) %>%
+  iniciar_en(sprintf("%.2f", round(p$theta, 2)))
+```
+
+```{r traspaso}
+xp <- seq(0.002, 1.2, length.out = 180)
+df_t <- do.call(rbind, lapply(thetas, function(th) rbind(
+  data.frame(x = expm1(xp) * 100, y = th / (th + xp) * 100, theta = sprintf("%.2f", th),
+             serie = "Traspaso marginal θ/(θ+X)"),
+  data.frame(x = expm1(xp) * 100, y = compresor(xp, th) / xp * 100, theta = sprintf("%.2f", th),
+             serie = "Traspaso promedio Y/X"))))
+
+plot_ly(df_t, x = ~x, y = ~y, color = ~serie, colors = c("#059669", "#a855f7"),
+        frame = ~theta, type = "scatter", mode = "lines", line = list(width = 3),
+        hovertemplate = "%{y:.1f} %", height = 440) %>%
+  estilo_plotly("Cuánto del alza llega al consumidor", "Paridad sobre su referencia (%)", "%") %>%
+  layout(shapes = list(linea_h(50, "#9ca3af")), yaxis = list(range = c(0, 105))) %>%
+  animation_opts(frame = 0, transition = 0, redraw = FALSE) %>%
+  animation_slider(active = which(thetas == round(p$theta, 2)) - 1,
+                   currentvalue = list(prefix = "θ = ", font = list(size = 12, color = "#111827")),
+                   pad = list(t = 55)) %>%
+  animation_button(visible = FALSE) %>%
+  iniciar_en(sprintf("%.2f", round(p$theta, 2)))
+```
+
+## Por qué una referencia móvil
+
+La compresión se aplica al exceso sobre un precio de largo plazo $R_n$ que se actualiza solo. Si
+el alza es transitoria, el consumidor nunca la recibe completa. Si es permanente, $R_n$ la incorpora
+(con $h = `r p$h`$ meses, la mitad del cambio en `r p$h` meses) y la brecha se cierra. El subsidio
+implícito es **temporal y decreciente**, a diferencia de un tope fijo.
+
+**Convergencia.** Si la paridad se estabiliza en $P^*$, entonces $R_n \to P^*$, $X_n \to 0$ y
+$T_n \to P^*$. Para $G_n > 0$ se cumple $0 < d_n \le \lambda G_n$ (porque $\tanh(z) \le z$), así que
+la brecha se reduce monotónicamente. Además, la serie $\sum_m c_\uparrow/(1+\kappa\ln(1+m))$
+diverge, de modo que la fatiga frena el ajuste pero **no lo detiene**: el PT alcanza cualquier
+objetivo finito.
+
+El gráfico muestra una paridad ilustrativa con un **choque transitorio** (+40 % durante cuatro
+meses) y luego un **cambio permanente** (+30 %). Mueve el deslizador **h** para ver cómo la
+referencia $R$ ignora el choque transitorio y absorbe el permanente, y cómo el objetivo $T$ queda
+entre ambos.
+
+```{r referencia}
+n_ej <- 40
+P_ej <- 2.6 * c(rep(1, 5), rep(1.4, 4), rep(1, 9), rep(1.3, n_ej - 18))
+mes_ej <- seq_len(n_ej)
+hs <- sort(unique(c(3, 6, 9, 12, 18, 24, p$h)))
+df_r <- do.call(rbind, lapply(hs, function(hh) {
+  w <- 1 - 0.5^(1 / hh); lnR <- numeric(n_ej); lnR[1] <- log(P_ej[1])
+  for (i in 2:n_ej) lnR[i] <- lnR[i - 1] + w * (log(P_ej[i]) - lnR[i - 1])
+  X <- log(P_ej) - lnR
+  Tn <- exp(lnR + ifelse(X > 0, p$theta * log1p(pmax(X, 0) / p$theta), X))
+  data.frame(mes = mes_ej, R = exp(lnR), T = Tn, h = sprintf("%02d meses", hh))
+}))
+
+plot_ly(height = 460) %>%
+  add_lines(x = mes_ej, y = P_ej, name = "Paridad P", line = list(color = COL[["Paridad"]], dash = "dot", width = 2),
+            hovertemplate = "P: %{y:.3f}<extra></extra>") %>%
+  add_lines(data = df_r, x = ~mes, y = ~R, frame = ~h, name = "Referencia R",
+            line = list(color = COL[["Referencia R"]], width = 3),
+            hovertemplate = "R: %{y:.3f}<extra></extra>") %>%
+  add_lines(data = df_r, x = ~mes, y = ~T, frame = ~h, name = paste0("Objetivo T (θ = ", p$theta, ")"),
+            line = list(color = COL[["Objetivo T"]], dash = "dash", width = 2.5),
+            hovertemplate = "T: %{y:.3f}<extra></extra>") %>%
+  estilo_plotly("Referencia móvil: transitorio vs permanente", "Mes", "USD/gal") %>%
+  animation_opts(frame = 0, transition = 0, redraw = FALSE) %>%
+  animation_slider(active = which(hs == p$h) - 1,
+                   currentvalue = list(prefix = "Vida media h = ", font = list(size = 12, color = "#111827")),
+                   pad = list(t = 55)) %>%
+  animation_button(visible = FALSE) %>%
+  iniciar_en(sprintf("%02d meses", p$h))
+```
+
+## Por qué la tangente hiperbólica
+
+Para brechas pequeñas, $c\tanh(\lambda G/c) \approx \lambda G$: es un ajuste parcial clásico
+(modelo de corrección de errores), con vida media $\ln 0{,}5/\ln(1-\lambda)$ =
+`r fmt(log(0.5) / log(1 - p$lambda), 1)` meses. Para brechas grandes se satura en $c$
+**sin quiebre**. A diferencia del recorte de la banda, la función es continua y derivable:
+pequeños cambios en la paridad producen pequeños cambios en el precio, y desaparecen los meses
+«al tope» seguidos de saltos.
+
+Mueve el deslizador **λ** para ver cómo cambia la velocidad de ajuste; la línea gris es el ajuste
+parcial sin techo ($d = \lambda G$).
+
+```{r tanh}
+paso_tanh <- function(g, lam, cu, cd) ifelse(g > 0, cu * tanh(lam * g / cu), cd * tanh(lam * g / cd))
+gs <- seq(-0.4, 0.4, length.out = 201)
+lams <- sort(unique(round(c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, p$lambda), 2)))
+banda_s <- data.frame(g = gs * 100, d = pmin(pmax(gs, p$lim_inf), p$lim_sup) * 100)
+df_s <- do.call(rbind, lapply(lams, function(l)
+  data.frame(g = gs * 100, d = paso_tanh(gs, l, p$c_up, p$c_down) * 100,
+             lin = l * gs * 100, lam = sprintf("%.2f", l))))
+
+plot_ly(height = 460) %>%
+  add_lines(data = banda_s, x = ~g, y = ~d, name = "Banda DE 126 (corte duro)",
+            line = list(color = COL[["Banda DE 126"]], width = 2.5),
+            hovertemplate = "Banda: %{y:+.2f} %<extra></extra>") %>%
+  add_lines(data = df_s, x = ~g, y = ~lin, frame = ~lam, name = "Ajuste parcial λG (sin techo)",
+            line = list(color = "#9ca3af", dash = "dot", width = 1.5),
+            hovertemplate = "λG: %{y:+.2f} %<extra></extra>") %>%
+  add_lines(data = df_s, x = ~g, y = ~d, frame = ~lam, name = "MLA: c·tanh(λG/c)",
+            line = list(color = COL[["Logarítmico (MLA)"]], width = 3.5),
+            hovertemplate = "MLA: %{y:+.2f} %<extra></extra>") %>%
+  estilo_plotly("Ajuste mensual según la brecha", "Brecha con el objetivo G (%)",
+                "Ajuste del PT en el mes (%)") %>%
+  layout(yaxis = list(range = c(-12, 8)),
+         shapes = list(linea_h(p$c_up * 100, COL[["Logarítmico (MLA)"]], "dash"),
+                       linea_h(-p$c_down * 100, COL[["Logarítmico (MLA)"]], "dash")),
+         annotations = list(
+           list(x = 0.01, xref = "paper", y = p$c_up * 100, text = paste0("c↑ = ", fmt(p$c_up * 100, 1), " %"),
+                showarrow = FALSE, xanchor = "left", yanchor = "bottom",
+                font = list(size = 10, color = COL[["Logarítmico (MLA)"]])),
+           list(x = 0.99, xref = "paper", y = -p$c_down * 100, text = paste0("c↓ = −", fmt(p$c_down * 100, 1), " %"),
+                showarrow = FALSE, xanchor = "right", yanchor = "top",
+                font = list(size = 10, color = COL[["Logarítmico (MLA)"]])))) %>%
+  animation_opts(frame = 0, transition = 0, redraw = FALSE) %>%
+  animation_slider(active = which(lams == round(p$lambda, 2)) - 1,
+                   currentvalue = list(prefix = "λ = ", font = list(size = 12, color = "#111827")),
+                   pad = list(t = 55)) %>%
+  animation_button(visible = FALSE) %>%
+  iniciar_en(sprintf("%.2f", round(p$lambda, 2)))
+```
+
+## Por qué la fatiga logarítmica
+
+Es la respuesta directa al requisito de que, **en períodos prolongados de alza del WTI, el precio
+aumente en menor medida**. El techo mensual $c_n = c_\uparrow / (1 + \kappa\ln(1+m))$ baja rápido
+en los primeros meses de una racha y luego se estabiliza: con κ = `r p$kappa`, pasa de
+`r fmt(p$c_up * 100)` % a `r fmt(p$c_up / (1 + p$kappa * log(1 + 6)) * 100)` % tras 6 meses y a
+`r fmt(p$c_up / (1 + p$kappa * log(1 + 12)) * 100)` % tras 12. Al volver a un mes sin alza, la racha
+se reinicia.
+
+Mueve el deslizador **κ** para ver la intensidad de la fatiga. La línea muestra el **alza
+acumulada** máxima posible (eje derecho): con la banda crece de forma exponencial; con el MLA, de
+forma cada vez más lenta.
+
+```{r fatiga}
+ms <- 0:24
+kappas <- sort(unique(round(c(0, 0.1, 0.25, 0.4, 0.6, 0.8, 1.0, 1.5, p$kappa), 2)))
+df_f <- do.call(rbind, lapply(kappas, function(k) {
+  cn <- p$c_up / (1 + k * log1p(ms))
+  data.frame(m = ms, c = cn * 100, acum = expm1(cumsum(cn)) * 100, kappa = sprintf("%.2f", k))
+}))
+banda_acum <- data.frame(m = ms, acum = ((1 + p$lim_sup)^(ms + 1) - 1) * 100)
+
+plot_ly(height = 470) %>%
+  add_bars(data = df_f, x = ~m, y = ~c, frame = ~kappa, name = "Techo mensual MLA c (%)",
+           marker = list(color = COL[["Logarítmico (MLA)"]], opacity = 0.85),
+           hovertemplate = "Techo MLA: %{y:.2f} %<extra></extra>") %>%
+  add_lines(data = df_f, x = ~m, y = ~acum, frame = ~kappa, yaxis = "y2",
+            name = "Alza acumulada máx. MLA (eje der.)",
+            line = list(color = "#065f46", width = 3),
+            hovertemplate = "Acumulada MLA: +%{y:.1f} %<extra></extra>") %>%
+  add_lines(data = banda_acum, x = ~m, y = ~acum, yaxis = "y2",
+            name = "Alza acumulada máx. banda (eje der.)",
+            line = list(color = COL[["Banda DE 126"]], width = 2.5, dash = "dash"),
+            hovertemplate = "Acumulada banda: +%{y:.1f} %<extra></extra>") %>%
+  estilo_plotly("Techo de alza mensual según la duración de la racha",
+                "Meses consecutivos de alza (m)", "Techo mensual (%)") %>%
+  layout(yaxis = list(range = c(0, max(p$lim_sup, p$c_up) * 100 * 1.15)),
+         yaxis2 = list(overlaying = "y", side = "right", title = "Alza acumulada (%)",
+                       showgrid = FALSE, zeroline = FALSE,
+                       range = c(0, max(banda_acum$acum) * 1.05)),
+         shapes = list(linea_h(p$lim_sup * 100, COL[["Banda DE 126"]], "dash")),
+         annotations = list(list(x = 0.01, xref = "paper", y = p$lim_sup * 100,
+                                 text = "Techo mensual banda (5 %)", showarrow = FALSE,
+                                 xanchor = "left", yanchor = "bottom",
+                                 font = list(size = 10, color = COL[["Banda DE 126"]]))),
+         margin = list(r = 70)) %>%
+  animation_opts(frame = 0, transition = 0, redraw = FALSE) %>%
+  animation_slider(active = which(kappas == round(p$kappa, 2)) - 1,
+                   currentvalue = list(prefix = "κ = ", font = list(size = 12, color = "#111827")),
+                   pad = list(t = 55)) %>%
+  animation_button(visible = FALSE) %>%
+  iniciar_en(sprintf("%.2f", round(p$kappa, 2)))
+```
+
+## Por qué la coherencia direccional
+
+Si la paridad baja en el mes, el PT no sube. Esto elimina la situación que motivó el DE 444 (el PT
+subiendo al +5 % mientras el mercado internacional cae) sin necesidad de umbrales de activación.
+
+# Implementación en R
+
+```{r motores, class.source = "fold-show"}
+# ---- Paridad aproximada desde el WTI: P = S·(WTI[t-rezago]/WTI_ref)^e ----
+paridad_desde_wti <- function(wti, S, rezago, e, wti_ref = wti[1]) {
+  n <- length(wti)
+  des <- if (rezago > 0) c(rep(wti[1], rezago), wti[seq_len(n - rezago)]) else wti
+  S * (des / wti_ref)^e
+}
+
+# ---- Banda DE 126 ----
+banda_de126 <- function(P, pt0, lim_sup = .05, lim_inf = -.10, base = 2.229421) {
+  n <- length(P); pt <- numeric(n); tramo <- character(n); prev <- pt0
+  for (i in seq_len(n)) {
+    a <- P[i] / prev - 1
+    pt[i] <- max(prev * (1 + min(max(a, lim_inf), lim_sup)), base)
+    tramo[i] <- if (a >= lim_sup) "Techo" else if (a <= lim_inf) "Piso banda" else "Banda"
+    prev <- pt[i]
+  }
+  data.frame(P = P, pt = pt, var = pt / c(pt0, head(pt, -1)) - 1, tramo = tramo)
+}
+
+# ---- Vigente: DE 126 + excepcional DE 444 / DE 468 ----
+vigente_444 <- function(P, pt0, lim_sup = .05, lim_inf = -.10, base = 2.229421,
+                        una_sola_vez = TRUE) {
+  n <- length(P); pt <- numeric(n); tramo <- character(n)
+  prev <- pt0; activo <- FALSE; k <- 0; ya <- FALSE; var_prev <- NA
+  for (i in seq_len(n)) {
+    a <- P[i] / prev - 1; a_ord <- min(max(a, lim_inf), lim_sup); est <- ""
+    if (!activo && !(una_sola_vez && ya) && i >= 6) {
+      c1 <- P[i] / P[i - 2] - 1 <= -0.15
+      c2 <- P[i - 2] / P[i - 5] - 1 >= 0.50
+      c3 <- a_ord >= lim_sup - 1e-12 && !is.na(var_prev) && var_prev >= lim_sup - 1e-12
+      if (c1 && c2 && c3) { activo <- TRUE; k <- 0; ya <- TRUE; est <- "Activación" }
+    }
+    if (activo) {
+      s1 <- P[i] <= prev
+      s2 <- i >= 5 && P[i] / P[i - 4] - 1 >= 0.40
+      if (s1 || s2) { activo <- FALSE; est <- if (s1) "Salida (PPI ≤ PT)" else "Salida (PPI +40 % en 4m)" }
+    }
+    if (activo) {
+      alfa <- min(0.0075 + 0.0025 * k, 0.015); k <- k + 1
+      pt[i] <- prev * (1 - alfa)
+      if (pt[i] < base) { pt[i] <- base; activo <- FALSE; est <- "Salida (precio base)" }
+      else if (est == "") est <- sprintf("Excepcional α=%.2f %%", alfa * 100)
+    } else {
+      pt[i] <- max(prev * (1 + a_ord), base)
+      if (est == "") est <- if (a >= lim_sup) "Techo" else if (a <= lim_inf) "Piso banda" else "Banda"
+    }
+    tramo[i] <- est; var_prev <- pt[i] / prev - 1; prev <- pt[i]
+  }
+  data.frame(P = P, pt = pt, var = pt / c(pt0, head(pt, -1)) - 1, tramo = tramo)
+}
+
+# ---- Propuesta: Mecanismo Logarítmico Amortiguado ----
+mla <- function(P, pt0, h = 9, theta = .20, theta_baja = 0, lambda = .5, c_up = .04,
+                c_down = .08, kappa = .25, coherencia = TRUE, base = 2.229421) {
+  n <- length(P); w <- 1 - 0.5^(1 / h)
+  out <- data.frame(P = P, R = NA, X = NA, Y = NA, traspaso = NA, T = NA, pt_prev = NA,
+                    G = NA, m = NA, c_n = NA, d = NA, pt = NA, var = NA, tramo = NA)
+  lnR <- log(P[1]); prev <- pt0; racha <- 0
+  for (i in seq_len(n)) {
+    lnP <- log(P[i])
+    if (i > 1) lnR <- lnR + w * (lnP - lnR)                       # (1)
+    X <- lnP - lnR                                                 # (2)
+    Y <- if (X > 0) theta * log1p(X / theta) else                  # (3)
+         if (theta_baja > 0) -theta_baja * log1p(-X / theta_baja) else X
+    lnT <- lnR + Y                                                 # (4)
+    G <- lnT - log(prev)                                           # (5)
+    cn <- c_up / (1 + kappa * log1p(racha))                        # (6)
+    d <- if (G > 0) cn * tanh(lambda * G / cn) else c_down * tanh(lambda * G / c_down)  # (7)
+    coh <- coherencia && i > 1 && P[i] < P[i - 1] && d > 0         # (8)
+    if (coh) d <- 0
+    pt <- prev * exp(d); piso <- pt < base; pt <- max(pt, base)    # (9)
+    out[i, ] <- list(P[i], exp(lnR), X, Y,
+                     if (X > 0) theta / (theta + X) else 1, exp(lnT), prev, G, racha, cn, d, pt,
+                     pt / prev - 1,
+                     if (piso) "Piso (precio base)" else if (coh) "Coherencia (paridad baja)"
+                     else if (d > 0) "Alza amortiguada" else if (d < 0) "Baja" else "Sin cambio")
+    racha <- if (pt > prev * (1 + 1e-9)) racha + 1 else 0
+    prev <- pt
+  }
+  out
+}
+
+# ---- PVP con redondeo al tercer decimal hacia arriba ----
+pvp <- function(pt, mgc = p$mgc, iva = p$iva) ceiling(round((pt + mgc) * (1 + iva), 9) * 1000) / 1000
+
+# ---- Indicadores de comparación ----
+metricas <- function(df) {
+  v <- df$var; lv <- log1p(v); P <- df$P; PT <- df$pt; lPT <- log(PT)
+  dif_lag <- function(x, k) if (length(x) > k) max(diff(x, lag = k)) else NA
+  r12 <- if (length(PT) > 12) dif_lag(lPT, 12) else log(PT[length(PT)] / PT[1])
+  sg <- sign(v[abs(v) > 1e-9])
+  c(`Volatilidad mensual (pp)` = sqrt(mean((lv - mean(lv))^2)) * 100,
+    `Alza máx. mensual (%)` = max(v) * 100,
+    `Baja máx. mensual (%)` = min(v) * 100,
+    `Alza máx. 3 meses (%)` = expm1(dif_lag(lPT, 3)) * 100,
+    `Alza máx. 12 meses (%)` = expm1(r12) * 100,
+    `Meses al alza ≥ 4,9 %` = sum(v >= 0.049),
+    `Meses contra-dirección` = sum(c(0, diff(P)) < 0 & v > 1e-9),
+    `Reversiones de signo` = if (length(sg) > 1) sum(sg[-1] != sg[-length(sg)]) else 0,
+    `Brecha acumulada (USD/gal·mes)` = sum(pmax(P - PT, 0)),
+    `Sobreprecio acumulado (USD/gal·mes)` = sum(pmax(PT - P, 0)),
+    `Brecha final (USD/gal)` = P[length(P)] - PT[length(PT)],
+    `Seguimiento RMSE (USD/gal)` = sqrt(mean((P - PT)^2)))
+}
+
+correr_todo <- function(P, pt0) list(
+  `Banda DE 126` = banda_de126(P, pt0, p$lim_sup, p$lim_inf, p$precio_base),
+  `Vigente DE 444/468` = vigente_444(P, pt0, p$lim_sup, p$lim_inf, p$precio_base, p$una_sola_vez),
+  `Logarítmico (MLA)` = mla(P, pt0, p$h, p$theta, p$theta_baja, p$lambda, p$c_up, p$c_down,
+                            p$kappa, p$coherencia, p$precio_base))
+
+pt0 <- p$pvp0 / (1 + p$iva) - p$mgc
+```
+
+El PT de partida, implícito en el PVP de `r fmt(p$pvp0, 3)` USD/gal, es **`r fmt(pt0, 6)`** USD/gal
+sin IVA.
+
+# Escenarios de WTI
+
+Los escenarios son **sintéticos** y sirven para estudiar el comportamiento de cada regla. La
+paridad se aproxima como $P_n = S\,(WTI_{n-`r p$rezago`}/WTI_0)^{`r p$elasticidad`}$ con
+$S$ = `r p$S` USD/gal.
+
+```{r escenarios}
+escenario <- function(nombre, meses = 48, wti0 = 65) {
+  t <- 0:(meses - 1); r <- numeric(meses)
+  switch(nombre,
+    "Alza prolongada" = wti0 * exp(cumsum(c(0, ifelse(t < 24, 0.03, 0)[-1]))),
+    "Choque y reversión" = { r[7:9] <- log(1.7) / 3; r[10:13] <- log(0.6) / 4; wti0 * exp(cumsum(r)) },
+    "Ciclo tipo 2021-2023" = wti0 * exp(c(seq(0, log(1.8), length.out = 16),
+                                         seq(log(1.8), log(1.15), length.out = 12),
+                                         rep(log(1.15), max(meses - 28, 0)))[1:meses]),
+    "Escalera de choques" = {
+      for (i in c(4, 14, 26, 38)) r[(i + 1):(i + 2)] <- log(1.25) / 2
+      for (i in c(9, 20, 32)) r[(i + 1):(i + 2)] <- log(0.88) / 2
+      wti0 * exp(cumsum(r)) },
+    "Paseo aleatorio (GBM)" = { set.seed(11); z <- rnorm(meses, 0.005 - 0.5 * 0.09^2, 0.09)
+      z[1] <- 0; wti0 * exp(cumsum(z)) })
+}
+ESC <- c("Alza prolongada", "Choque y reversión", "Ciclo tipo 2021-2023",
+         "Escalera de choques", "Paseo aleatorio (GBM)")
+periodos <- seq(as.Date("2026-12-12"), by = "month", length.out = 48)
+
+resultados <- lapply(ESC, function(e) {
+  wti <- escenario(e)
+  P <- paridad_desde_wti(wti, p$S, p$rezago, p$elasticidad)
+  list(wti = wti, P = P, res = correr_todo(P, pt0))
+})
+names(resultados) <- ESC
+
+largo <- function(r, fechas) {
+  rbind(data.frame(fecha = fechas, valor = r$P, serie = "Paridad"),
+        do.call(rbind, lapply(names(r$res), function(k)
+          data.frame(fecha = fechas, valor = r$res[[k]]$pt, serie = k))))
+}
+ESTILO_LINEA <- list(`Banda DE 126` = list(dash = "solid", width = 2),
+                     `Vigente DE 444/468` = list(dash = "dash", width = 2),
+                     `Logarítmico (MLA)` = list(dash = "solid", width = 3.5))
+
+# Gráfico interactivo: paridad y PT de las tres reglas (WTI opcional en eje derecho)
+grafico_trayectorias <- function(r, fechas, titulo, wti = NULL, alto = 500) {
+  pl <- plot_ly(height = alto) %>%
+    add_lines(x = fechas, y = r$P, name = "Paridad",
+              line = list(color = COL[["Paridad"]], dash = "dot", width = 2),
+              hovertemplate = "%{y:.4f}")
+  for (k in names(r$res)) {
+    pl <- pl %>% add_lines(x = fechas, y = r$res[[k]]$pt, name = k, text = r$res[[k]]$tramo,
+                           line = c(list(color = COL[[k]]), ESTILO_LINEA[[k]]),
+                           hovertemplate = "%{y:.4f} · %{text}")
+  }
+  if (!is.null(wti)) {
+    pl <- pl %>% add_lines(x = fechas, y = wti, name = "WTI (eje der.)", yaxis = "y2",
+                           visible = "legendonly", line = list(color = "#374151", width = 1.5),
+                           hovertemplate = "%{y:.1f} USD/bbl")
+  }
+  pl %>%
+    estilo_plotly(titulo, NULL, "USD/gal sin IVA", leyenda = "arriba") %>%
+    layout(xaxis = list(rangeslider = list(visible = TRUE, thickness = 0.07),
+                        tickformat = "%b %Y", hoverformat = "%b %Y"),
+           yaxis2 = list(overlaying = "y", side = "right", title = "WTI (USD/bbl)",
+                         showgrid = FALSE, zeroline = FALSE,
+                         range = if (!is.null(wti)) range(wti) * c(0.9, 1.05) else NULL),
+           shapes = list(linea_h(p$precio_base)),
+           annotations = list(list(x = 1, xref = "paper", y = p$precio_base, yref = "y",
+                                   text = "Precio base", showarrow = FALSE, xanchor = "right",
+                                   yanchor = "bottom", font = list(size = 10, color = "#7c3aed"))))
+}
+
+# Bloque completo de un escenario: gráfico + indicadores + activación del excepcional
+bloque_escenario <- function(e) {
+  r <- resultados[[e]]
+  m <- sapply(r$res, metricas)
+  ex <- r$res$`Vigente DE 444/468`
+  act <- which(grepl("Activación|Excepcional|Salida", ex$tramo))
+  extra <- if (length(act)) tagList(
+    tags$p("El mecanismo excepcional vigente se activó en este escenario:"),
+    tabla_html(data.frame(Periodo = format(periodos[act], "%Y-%m"), Paridad = round(ex$P[act], 4),
+                          PT = round(ex$pt[act], 4), Estado = ex$tramo[act]),
+               col.names = c("Período", "Paridad", "PT", "Estado")))
+  tagList(grafico_trayectorias(r, periodos, paste("PT vs paridad –", e), wti = r$wti),
+          tabla_html(round(m, 2), caption = paste("Indicadores –", e)), extra)
+}
+```
+
+En cada gráfico puedes acercar un tramo con el deslizador inferior, ocultar o mostrar series
+haciendo clic en la leyenda y activar la serie del **WTI** (eje derecho).
+
+## Alza prolongada
+
+```{r esc-alza}
+bloque_escenario("Alza prolongada")
+```
+
+## Choque y reversión
+
+```{r esc-choque}
+bloque_escenario("Choque y reversión")
+```
+
+## Ciclo tipo 2021-2023
+
+```{r esc-ciclo}
+bloque_escenario("Ciclo tipo 2021-2023")
+```
+
+## Escalera de choques
+
+```{r esc-escalera}
+bloque_escenario("Escalera de choques")
+```
+
+## Paseo aleatorio (GBM)
+
+```{r esc-gbm}
+bloque_escenario("Paseo aleatorio (GBM)")
+```
+
+# Resumen comparativo
+
+```{r resumen}
+claves <- c("Volatilidad mensual (pp)", "Alza máx. mensual (%)", "Alza máx. 12 meses (%)",
+            "Meses al alza ≥ 4,9 %", "Brecha acumulada (USD/gal·mes)")
+tab <- do.call(rbind, lapply(ESC, function(e) {
+  m <- sapply(resultados[[e]]$res, metricas)
+  data.frame(Escenario = e, Indicador = claves,
+             Banda = round(m[claves, "Banda DE 126"], 2),
+             Vigente = round(m[claves, "Vigente DE 444/468"], 2),
+             MLA = round(m[claves, "Logarítmico (MLA)"], 2), row.names = NULL)
+}))
+kable(tab, caption = "Banda DE 126 vs vigente (DE 444/468) vs MLA en todos los escenarios")
+```
+
+Elige el indicador en el menú desplegable. En todos, una barra más corta es mejor.
+
+```{r barras-resumen}
+ind_menu <- c("Alza máx. 12 meses (%)", "Alza máx. 3 meses (%)", "Alza máx. mensual (%)",
+              "Volatilidad mensual (pp)", "Meses al alza ≥ 4,9 %", "Brecha acumulada (USD/gal·mes)")
+reglas <- c("Banda DE 126", "Vigente DE 444/468", "Logarítmico (MLA)")
+mets <- lapply(ESC, function(e) sapply(resultados[[e]]$res, metricas))
+names(mets) <- ESC
+valor <- function(ind, regla) unname(vapply(ESC, function(e) mets[[e]][ind, regla], numeric(1)))
+
+pl <- plot_ly(height = 480)
+for (r in reglas) {
+  pl <- pl %>% add_bars(y = ESC, x = valor(ind_menu[1], r), orientation = "h", name = r,
+                        marker = list(color = COL[[r]]),
+                        text = fmt(valor(ind_menu[1], r), 1), textposition = "outside",
+                        textfont = list(size = 10),
+                        hovertemplate = paste0("<b>", r, "</b><br>%{y}: %{x:.2f}<extra></extra>"))
+}
+botones_ind <- lapply(ind_menu, function(ind) list(
+  label = ind, method = "update",
+  args = list(list(x = lapply(reglas, function(r) valor(ind, r)),
+                   text = lapply(reglas, function(r) fmt(valor(ind, r), 1))),
+              list(title = list(text = paste0("<b>", ind, " por escenario</b>"), font = list(size = 13),
+                                x = 0.01, xanchor = "left", y = 0.98, yref = "container", yanchor = "top"),
+                   `xaxis.title.text` = ind))))
+pl %>%
+  estilo_plotly(paste(ind_menu[1], "por escenario"), ind_menu[1], NULL, hover = "closest",
+                leyenda = "arriba") %>%
+  layout(barmode = "group", bargap = 0.25,
+         yaxis = list(autorange = "reversed", tickfont = list(size = 11)),
+         xaxis = list(rangemode = "tozero"),
+         margin = list(l = 150),
+         updatemenus = list(list(type = "dropdown", active = 0, buttons = botones_ind,
+                                 x = 1, xanchor = "right", y = 1.01, yanchor = "bottom",
+                                 font = list(size = 11))))
+```
+
+# Cómo se construye el precio MLA
+
+La paridad, su referencia de largo plazo, el objetivo comprimido y el PT resultante. Elige el
+escenario en el menú desplegable; al pasar el cursor sobre el PT verás el tramo de cada mes.
+
+```{r construccion}
+series_c <- list(list(col = "P", nom = "Paridad", lin = list(color = COL[["Paridad"]], dash = "dot", width = 2)),
+                 list(col = "R", nom = "Referencia R", lin = list(color = COL[["Referencia R"]], width = 2)),
+                 list(col = "T", nom = "Objetivo T", lin = list(color = COL[["Objetivo T"]], dash = "dash", width = 2.5)),
+                 list(col = "pt", nom = "PT MLA", lin = list(color = COL[["Logarítmico (MLA)"]], width = 3.5)))
+inicial <- which(ESC == "Choque y reversión")
+pl <- plot_ly(height = 500)
+for (i in seq_along(ESC)) {
+  ri <- resultados[[ESC[i]]]$res$`Logarítmico (MLA)`
+  for (s in series_c) {
+    pl <- pl %>% add_lines(x = periodos, y = ri[[s$col]], name = s$nom, line = s$lin,
+                           visible = i == inicial, legendgroup = s$nom, showlegend = TRUE,
+                           text = if (s$col == "pt") ri$tramo else NULL,
+                           hovertemplate = if (s$col == "pt") "%{y:.4f} · %{text}" else "%{y:.4f}")
+  }
+}
+botones <- lapply(seq_along(ESC), function(i) list(
+  label = ESC[i], method = "update",
+  args = list(list(visible = as.list(rep(seq_along(ESC), each = length(series_c)) == i)),
+              list(title = list(text = paste0("<b>Componentes del MLA – ", ESC[i], "</b>"),
+                                font = list(size = 13), x = 0.01, xanchor = "left",
+                                y = 0.98, yref = "container", yanchor = "top")))))
+pl %>%
+  estilo_plotly(paste("Componentes del MLA –", ESC[inicial]), NULL, "USD/gal sin IVA", leyenda = "arriba") %>%
+  layout(xaxis = list(tickformat = "%b %Y", hoverformat = "%b %Y"),
+         updatemenus = list(list(type = "dropdown", active = inicial - 1, buttons = botones,
+                                 x = 1, xanchor = "right", y = 1.01, yanchor = "bottom",
+                                 font = list(size = 11))))
+```
+
+Primeros 18 períodos del escenario **Choque y reversión**:
+
+```{r construccion-tabla}
+r <- resultados[["Choque y reversión"]]$res$`Logarítmico (MLA)`
+tabla <- transform(r[1:18, ], periodo = format(periodos[1:18], "%Y-%m"), PVP = pvp(r$pt[1:18]))
+kable(tabla[, c("periodo", "P", "R", "X", "Y", "traspaso", "T", "G", "m", "c_n", "d", "pt", "PVP", "tramo")],
+      digits = 4, caption = "Primeros 18 períodos del cálculo MLA")
+```
+
+# Prueba de estrés: WTI multiplicado por 5
+
+```{r estres}
+w_x5 <- c(rep(60, 6), 60 * exp(seq(0, log(5), length.out = 6)), rep(300, 36))
+P_x5 <- paridad_desde_wti(w_x5, p$S, p$rezago, p$elasticidad)
+r_x5 <- correr_todo(P_x5, pt0)
+f_x5 <- seq(as.Date("2026-12-12"), by = "month", length.out = length(w_x5))
+grafico_trayectorias(list(P = P_x5, res = r_x5), f_x5, "Estrés: WTI ×5 sostenido", wti = w_x5)
+kable(round(sapply(r_x5, metricas), 2))
+```
+
+El MLA no supera `r fmt(max(r_x5$"Logarítmico (MLA)"$var) * 100)` % de alza en ningún mes y
+`r fmt(metricas(r_x5$"Logarítmico (MLA)")["Alza máx. 12 meses (%)"], 1)` % en doce meses, frente a
+`r fmt(metricas(r_x5$"Banda DE 126")["Alza máx. 12 meses (%)"], 1)` % de la banda. El costo es una
+brecha que al final del horizonte todavía es de
+`r fmt(metricas(r_x5$"Logarítmico (MLA)")["Brecha final (USD/gal)"])` USD/gal: ante choques extremos y
+permanentes, la convergencia es lenta y requiere respaldo fiscal o un κ menor.
+
+# Frontera estabilidad–costo
+
+Cada punto es una calibración del MLA sobre el escenario **Ciclo tipo 2021-2023**. Abajo a la
+izquierda es mejor: menos volatilidad y menos brecha. Pasa el cursor sobre un punto para ver su
+θ, su h y el alza máxima en 12 meses; haz clic en la leyenda para aislar una vida media.
+
+```{r frontera}
+Pc <- resultados[["Ciclo tipo 2021-2023"]]$P
+grid <- expand.grid(h = c(4, 6, 9, 12, 18), theta = c(.05, .10, .15, .20, .30, .45, .70, 1))
+grid[c("vol", "brecha", "max12")] <- t(apply(grid, 1, function(g) {
+  m <- metricas(mla(Pc, pt0, g["h"], g["theta"], p$theta_baja, p$lambda, p$c_up, p$c_down,
+                    p$kappa, p$coherencia, p$precio_base))
+  m[c("Volatilidad mensual (pp)", "Brecha acumulada (USD/gal·mes)", "Alza máx. 12 meses (%)")]
+}))
+ref <- sapply(resultados[["Ciclo tipo 2021-2023"]]$res, metricas)
+pts <- data.frame(Regla = colnames(ref), brecha = ref["Brecha acumulada (USD/gal·mes)", ],
+                  vol = ref["Volatilidad mensual (pp)", ])
+verdes <- c("#86efac", "#4ade80", "#16a34a", "#166534", "#052e16")
+hs_f <- sort(unique(grid$h))
+pl <- plot_ly(height = 520)
+for (i in seq_along(hs_f)) {
+  g <- grid[grid$h == hs_f[i], ]
+  pl <- pl %>% add_trace(
+    data = g, x = ~brecha, y = ~vol, type = "scatter", mode = "lines+markers",
+    name = paste("MLA, h =", hs_f[i], "meses"),
+    line = list(color = verdes[i], width = 2), marker = list(color = verdes[i], size = 9),
+    text = ~sprintf("<b>MLA</b> · h = %d meses · θ = %.2f<br>Brecha acumulada: %s<br>Volatilidad: %s pp<br>Alza máx. 12 m: %s %%",
+                    h, theta, fmt(brecha), fmt(vol), fmt(max12, 1)),
+    hoverinfo = "text")
+}
+for (k in seq_len(nrow(pts))) {
+  pl <- pl %>% add_trace(
+    x = pts$brecha[k], y = pts$vol[k], type = "scatter", mode = "markers", name = pts$Regla[k],
+    marker = list(symbol = "diamond", size = c(22, 13, 17)[k], color = COL[[pts$Regla[k]]],
+                  line = list(color = "black", width = 1)),
+    text = sprintf("<b>%s</b><br>Brecha acumulada: %s<br>Volatilidad: %s pp", pts$Regla[k],
+                   fmt(pts$brecha[k]), fmt(pts$vol[k])),
+    hoverinfo = "text")
+}
+pl %>% estilo_plotly("Frontera estabilidad vs costo", "Brecha acumulada (USD/gal·mes)",
+                     "Volatilidad mensual del PT (pp)", hover = "closest")
+
+kable(xtabs(round(max12, 1) ~ theta + h, grid),
+      caption = "Alza máxima del PT en 12 meses (%) según θ (filas) y h (columnas)")
+```
+
+# Análisis comparativo ante choques geopolíticos
+
+## Cómo ajusta cada método
+
+| | **DE 126 (banda)** | **DE 444/468 (excepcional)** | **MLA (propuesta)** |
+|---|---|---|---|
+| Ancla | Paridad de importación (PPImgn) | La misma, pero mientras está activo el PT deja de mirarla | La misma paridad |
+| Regla | PT hacia la paridad, entre +5 % y −10 % al mes | Si se cumplen 3 condiciones a la vez, el PT baja 0,75 % → 1,50 % cada mes | Exceso sobre una referencia de largo plazo comprimido con un logaritmo; paso mensual suave (tanh) que se reduce si las alzas se encadenan |
+| Forma | Corte duro, con quiebres | Interruptor que se enciende y se apaga por umbrales | Continua, sin umbrales |
+| Memoria | Solo el PT anterior | PPI de los 5 meses anteriores y PT de los 2 anteriores | Referencia R y meses seguidos de alza |
+
+## Puntos fuertes y débiles
+
+| Método | Puntos fuertes | Puntos débiles |
+|---|---|---|
+| **DE 126, banda** | Simple y fácil de comunicar («máximo 5 % al mes»). Costo fiscal bajo: cierra la brecha con la paridad en 6 a 9 meses. | Procíclica: en un choque largo encadena alzas al tope. Puede subir mientras la paridad cae, el defecto que motivó el DE 444. |
+| **DE 444/468, excepcional** | Frena el alza en un pico seguido de caída. | Regla de patrón: exige caída bimestral ≥ 15 %, alza previa ≥ 50 % y dos alzas al tope a la vez, así que muchos choques no la activan. Una vez activa pierde el ancla: puede bajar el precio mientras la paridad sube. Ambigüedades («por una sola vez», remisiones al DE 83 y al DE 308). |
+| **MLA** | Alza anual y volatilidad cerca de la mitad que la banda. Nunca hay meses al tope ni alzas cuando la paridad baja. Sin umbrales. Siempre converge a la paridad: el subsidio es temporal. | Más costo fiscal: brecha acumulada mayor que la de la banda. Convergencia más lenta ante cambios permanentes. Más difícil de explicar y depende de parámetros que deben fijarse por norma. |
+
+## Respuesta ante choques geopolíticos
+
+Un choque geopolítico (un conflicto, el bloqueo de una ruta marítima, sanciones) eleva el WTI de
+forma brusca y, en el momento, **nadie sabe si será transitorio o permanente**. Simulamos cuatro
+formas típicas de choque sobre la paridad, partiendo del mismo PT. Elige el choque en el menú.
+
+```{r geo-escenarios}
+construir <- function(segs, base = 2.60, n = 36) {
+  r <- 0
+  for (s in segs) r <- c(r, rep(log(1 + s[2]) / s[1], s[1]))
+  base * exp(cumsum(c(r, rep(0, n))[1:n]))
+}
+GEO <- list(
+  "A. Pico transitorio: +60 % en 2 meses, revierte en 4" =
+    construir(list(c(1, 0), c(2, .6), c(2, 0), c(4, 1 / 1.6 - 1))),
+  "B. Choque persistente tipo 2022: +80 %, 8 meses arriba" =
+    construir(list(c(1, 0), c(4, .8), c(8, 0), c(6, 1.2 / 1.8 - 1))),
+  "C. Cambio permanente de nivel: +50 %" =
+    construir(list(c(1, 0), c(3, .5))),
+  "D. Doble choque tipo 2026: +84 %, −17 %, rebote +15 %" =
+    construir(list(c(1, 0), c(3, .84), c(2, -.17), c(1, .15), c(6, 0), c(6, -.25))))
+geo_res <- lapply(GEO, function(P) correr_todo(P, pt0))
+
+alza_ventana12 <- function(pt) 100 * max(sapply(seq_along(pt), function(i)
+  max(pt[i:min(length(pt), i + 12)]) / pt[i] - 1))
+convergencia <- function(P, pt, umbral = 0.02) {
+  g <- abs(P - pt) / P
+  for (i in which.max(P):length(P)) if (all(g[i:length(P)] < umbral)) return(i - which.max(P))
+  NA
+}
+
+meses_geo <- seq_along(GEO[[1]])
+reglas_geo <- names(geo_res[[1]])
+pl <- plot_ly(height = 500)
+for (i in seq_along(GEO)) {
+  pl <- pl %>% add_lines(x = meses_geo, y = GEO[[i]], name = "Paridad", legendgroup = "Paridad",
+                         visible = i == 1, line = list(color = COL[["Paridad"]], dash = "dot", width = 2),
+                         hovertemplate = "%{y:.4f}")
+  for (k in reglas_geo) {
+    pl <- pl %>% add_lines(x = meses_geo, y = geo_res[[i]][[k]]$pt, name = k, legendgroup = k,
+                           visible = i == 1, text = geo_res[[i]][[k]]$tramo,
+                           line = c(list(color = COL[[k]]), ESTILO_LINEA[[k]]),
+                           hovertemplate = "%{y:.4f} · %{text}")
+  }
+}
+n_tr <- 1 + length(reglas_geo)
+botones_geo <- lapply(seq_along(GEO), function(i) list(
+  label = names(GEO)[i], method = "update",
+  args = list(list(visible = as.list(rep(seq_along(GEO), each = n_tr) == i)),
+              list(title = list(text = paste0("<b>", names(GEO)[i], "</b>"), font = list(size = 13),
+                                x = 0.01, xanchor = "left", y = 0.98, yref = "container", yanchor = "top")))))
+pl %>%
+  estilo_plotly(names(GEO)[1], "Mes desde el inicio del choque", "USD/gal sin IVA", leyenda = "arriba") %>%
+  layout(shapes = list(linea_h(p$precio_base)),
+         updatemenus = list(list(type = "dropdown", active = 0, buttons = botones_geo,
+                                 x = 1, xanchor = "right", y = 1.01, yanchor = "bottom",
+                                 font = list(size = 11))))
+```
+
+```{r geo-tabla}
+tabla_geo <- do.call(rbind, lapply(names(GEO), function(e) {
+  P <- GEO[[e]]
+  do.call(rbind, lapply(reglas_geo, function(k) {
+    df <- geo_res[[e]][[k]]; m <- metricas(df)
+    data.frame(Choque = substr(e, 1, 1), Regla = k,
+               `Alza máx. 12 m (%)` = round(alza_ventana12(df$pt), 1),
+               `Meses al tope` = m[["Meses al alza ≥ 4,9 %"]],
+               `Meses contra-dirección` = m[["Meses contra-dirección"]],
+               `Brecha acumulada` = round(m[["Brecha acumulada (USD/gal·mes)"]], 2),
+               `Meses hasta converger` = convergencia(P, df$pt),
+               `Volatilidad (pp)` = round(m[["Volatilidad mensual (pp)"]], 2),
+               check.names = FALSE)
+  }))
+}))
+kable(tabla_geo, row.names = FALSE,
+      caption = "Indicadores por choque. «Alza máx. 12 m»: mayor subida del PT dentro de cualquier ventana de 12 meses. «Meses hasta converger»: desde el pico de la paridad hasta que la brecha queda por debajo de 2 %.")
+```
+
+**Lectura para la política de precios.**
+
+1. **La banda trata todo choque como permanente.** Sube al tope hasta alcanzar la paridad, aunque
+   el pico ya haya pasado: en el choque A sube cerca de 36 % para luego deshacerlo, y sigue
+   subiendo dos meses con la paridad en caída. El MLA aprende la persistencia sobre la marcha:
+   mientras el choque es reciente la referencia R casi no se mueve y el consumidor recibe solo una
+   parte; si el choque se mantiene, R lo absorbe y el precio converge.
+2. **El DE 444/468 está calibrado para un solo patrón.** En los choques A, B y C no se activa y da
+   lo mismo que la banda. En el D se activa y sigue recortando 1,5 % al mes con la paridad muy por
+   encima del PT; el rebote no dispara la salida del +40 % en cuatro meses. El resultado es la
+   mayor brecha de todas y un PT que no converge en el horizonte.
+3. **Ecuador está dolarizado.** Ningún tipo de cambio amortigua el choque: el alza del WTI llega
+   completa al diésel, y del diésel al transporte y a los alimentos. La velocidad del ajuste es
+   tan relevante, social y políticamente, como su nivel. El MLA permite fijarla de forma explícita.
+4. **El costo de suavizar existe en cualquier regla.** En la banda queda en los primeros meses; en
+   el DE 444/468, en la brecha que se abre al activarse; en el MLA es explícito y regulable con θ,
+   h y κ (sección 10).
+
+## Fundamento técnico para fijar el precio con el MLA
+
+1. **Principio de eficiencia.** El precio de referencia sigue siendo el costo de oportunidad del
+   diésel: la paridad de importación, igual que en el DE 126. El MLA solo regula la velocidad de
+   convergencia, no el destino (sección 4.3): no crea un subsidio permanente y respeta los fines del
+   DE 126. Es el diseño que recomienda el FMI: mecanismos automáticos con suavizado que trasladan el
+   precio completo en el mediano plazo (Coady et al., IMF Technical Notes 2012/03).
+2. **Fundamento estadístico.** El crudo se comporta aproximadamente como una variable log-normal:
+   sus cambios son proporcionales al nivel. En logaritmos, una subida y la bajada que la deshace
+   son simétricas, las variaciones se suman y la regla funciona igual a cualquier nivel de precio.
+3. **Fundamento económico-conductual.** Hogares y transportistas perciben las alzas en términos
+   relativos y acumulados (ley de Weber–Fechner, aversión a las pérdidas). La función
+   θ·ln(1 + X/θ) traslada casi uno a uno los movimientos normales y cada vez menos los extremos.
+4. **Gestión de riesgo.** La compresión equivale a una cobertura implícita contra choques extremos
+   con un costo medible (brecha × galones despachados), que se puede presupuestar y someter al
+   dictamen del MEF (art. 74, num. 15 del COPLAFIP).
+5. **Fundamento dinámico.** El paso tanh es un modelo de ajuste parcial (Nerlove, corrección de
+   errores) con techo suave: continuo, robusto a revisiones de datos y sin umbrales que se puedan
+   anticipar.
+6. **Asimetría a favor del consumidor.** Las bajas se trasladan completas, lo que evita el patrón
+   de «sube como cohete, baja como pluma» documentado en mercados de combustibles (Bacon, 1991).
+7. **Calibración con datos, no discrecional.** Cada parámetro tiene una regla de cálculo; la
+   sección siguiente la aplica a la serie 2019–2026.
+
+# Calibración con la serie real 2019–2026
+
+```{r cal-base, include = FALSE}
+candidatos <- unique(c(params$archivo_calibracion, "BASE_FINAL_WTI_BRENT.xlsx",
+                       "../BASE_FINAL_WTI_BRENT.xlsx", "datos/BASE_FINAL_WTI_BRENT.xlsx"))
+ruta_base <- candidatos[file.exists(candidatos)][1]
+hay_base <- !is.na(ruta_base)
+vv <- function(expr) if (hay_base) expr else "—"
+```
+
+`r if (!hay_base) "> **No se encontró BASE_FINAL_WTI_BRENT.xlsx.** Indique la ruta en el parámetro archivo_calibracion del encabezado YAML para ejecutar esta sección."`
+
+## Datos y paridad
+
+```{r cal-datos, eval = hay_base}
+if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl", repos = "https://cloud.r-project.org")
+base <- as.data.frame(readxl::read_excel(ruta_base))
+base$FECHA <- as.Date(base$FECHA)
+base <- base[order(base$FECHA), ]
+base <- base[!duplicated(base$FECHA, fromLast = TRUE), ]
+cal_mes <- format(base$FECHA, "%Y-%m")
+wti_m <- tapply(base$WTI, cal_mes, mean, na.rm = TRUE)
+pvp_obs <- tapply(base$DIESEL, cal_mes, function(x) { x <- x[!is.na(x)]; if (length(x)) x[1] else NA })
+eventos <- sapply(c("D_Covid", "D_CONF_RUS_UCR", "D_CONF_USA_IRAN"),
+                  function(v) tapply(base[[v]], cal_mes, max, na.rm = TRUE))
+
+# Se extiende dos meses: con el rezago de 2 meses, el WTI de septiembre fija la paridad de noviembre
+ult <- as.Date(paste0(tail(names(wti_m), 1), "-01"))
+meses_c <- c(names(wti_m), format(seq(ult, by = "month", length.out = 3)[-1], "%Y-%m"))
+wti_lag <- c(NA, NA, wti_m); names(wti_lag) <- meses_c
+P_pvp <- params$S_pvp * wti_lag / wti_m[[params$mes_ref]]   # paridad equivalente a PVP
+P_cal <- P_pvp / (1 + p$iva) - p$mgc                         # paridad equivalente a PT
+fechas_c <- as.Date(paste0(meses_c, "-12"))
+pvp_obs <- pvp_obs[meses_c]
+
+sombra_eventos <- function(y0, y1) {
+  nombres <- c(D_Covid = "COVID", D_CONF_RUS_UCR = "Rusia–Ucrania", D_CONF_USA_IRAN = "EE. UU.–Irán")
+  formas <- list(); notas <- list()
+  for (v in colnames(eventos)) {
+    m <- rownames(eventos)[eventos[, v] > 0]
+    if (!length(m)) next
+    x0 <- as.Date(paste0(min(m), "-01")); x1 <- as.Date(paste0(max(m), "-28"))
+    formas[[v]] <- list(type = "rect", xref = "x", yref = "paper", x0 = x0, x1 = x1, y0 = 0, y1 = 1,
+                        fillcolor = "rgba(148,163,184,0.15)", line = list(width = 0), layer = "below")
+    notas[[v]] <- list(x = x0, y = 1, xref = "x", yref = "paper", text = nombres[[v]], showarrow = FALSE,
+                       xanchor = "left", yanchor = "top", font = list(size = 10, color = "#64748b"))
+  }
+  list(shapes = unname(formas), annotations = unname(notas))
+}
+sb <- sombra_eventos()
+plot_ly(height = 430) %>%
+  add_lines(x = as.Date(paste0(names(wti_m), "-15")), y = as.numeric(wti_m), name = "WTI mensual (USD/bbl)",
+            line = list(color = "#374151", width = 2), hovertemplate = "%{y:.2f} USD/bbl") %>%
+  add_lines(x = fechas_c, y = P_pvp, name = "Paridad equivalente a PVP (eje der.)", yaxis = "y2",
+            line = list(color = COL[["Paridad"]], dash = "dot", width = 2), hovertemplate = "%{y:.3f} USD/gal") %>%
+  add_markers(x = fechas_c, y = pvp_obs, name = "PVP observado (eje der.)", yaxis = "y2",
+              marker = list(color = "#111827", size = 6), hovertemplate = "%{y:.3f} USD/gal") %>%
+  estilo_plotly("WTI, paridad aproximada y PVP observado", NULL, "WTI (USD/bbl)", leyenda = "arriba") %>%
+  layout(xaxis = list(tickformat = "%b %Y", hoverformat = "%b %Y"),
+         yaxis2 = list(overlaying = "y", side = "right", title = "USD/gal", showgrid = FALSE, zeroline = FALSE),
+         shapes = sb$shapes, annotations = sb$annotations)
+```
+
+La base trae el WTI diario de `r vv(format(min(base$FECHA), "%B %Y"))` a
+`r vv(format(max(base$FECHA), "%d de %B de %Y"))` (se eliminaron
+`r vv(sum(duplicated(as.data.frame(readxl::read_excel(ruta_base))$FECHA)))` fechas duplicadas), el
+PVP observado del diésel y marcas de los episodios de COVID, Rusia–Ucrania y EE. UU.–Irán. La
+paridad sigue el ejercicio validado del proyecto:
+$P^{PVP}_n = `r params$S_pvp` \times WTI_{n-2} / WTI_{`r params$mes_ref`}$, y su equivalente en
+precio en terminal es $P_n = P^{PVP}_n/(1+IVA) - Mgc$.
+
+## Validación: la paridad reproduce el precio observado
+
+```{r cal-validacion, eval = hay_base}
+ini_v <- which(meses_c == "2025-11")
+fin_v <- max(which(!is.na(pvp_obs)))
+iv <- ini_v:length(meses_c)
+pt0_v <- 2.80 / (1 + p$iva) - p$mgc
+val_b <- banda_de126(P_cal[iv], pt0_v, p$lim_sup, p$lim_inf, p$precio_base)
+val_v <- vigente_444(P_cal[iv], pt0_v, p$lim_sup, p$lim_inf, p$precio_base, p$una_sola_vez)
+err <- pvp(val_v$pt[seq_len(fin_v - ini_v + 1)]) - pvp_obs[ini_v:fin_v]
+tabla_val <- data.frame(Período = meses_c[iv], `PVP observado` = round(pvp_obs[iv], 3),
+                        `Paridad (PVP)` = round(P_pvp[iv], 3),
+                        `Vigente simulado (PVP)` = pvp(val_v$pt), Tramo = val_v$tramo,
+                        check.names = FALSE, row.names = NULL)
+kable(tabla_val, caption = "Ventana real desde nov-2025 (PVP inicial 2,80). Los meses sin PVP observado son proyección con el WTI ya conocido.")
+```
+
+La regla vigente simulada se aparta del PVP observado en
+`r vv(fmt(100 * sqrt(mean(err^2, na.rm = TRUE)), 1))` centavos por galón en promedio (raíz del
+error cuadrático medio, `r vv(meses_c[ini_v])` a `r vv(meses_c[fin_v])`), y el mecanismo excepcional
+se activa en `r vv(meses_c[iv][which(val_v$tramo == "Activación")[1]])`, cuando entró en vigencia el
+DE 444. La aproximación de la paridad es suficiente para calibrar.
+
+## Vida media h: persistencia de los choques del WTI
+
+La referencia R debe absorber un choque al ritmo al que este demuestra ser persistente. Para
+medirlo se descompone el logaritmo del WTI mensual en un componente permanente (paseo aleatorio)
+y uno transitorio que se disipa como $\phi^k$. Con esa descomposición, la varianza de las
+variaciones a $k$ meses es
+
+$$
+\operatorname{Var}(\ln WTI_{t+k} - \ln WTI_t) = k\,\sigma^2_{p} + 2\,\sigma^2_{c}\,(1 - \phi^{k}),
+$$
+
+y se ajusta a las varianzas observadas para $k = 1, \dots, 24$ (método de razones de varianza,
+Cochrane, 1988). La vida media del componente transitorio es $\ln 0{,}5/\ln\phi$; ese valor,
+redondeado, es la h calibrada.
+
+```{r cal-h, eval = hay_base}
+lw <- log(wti_m)
+ajuste_vr <- function(lw, K = 24) {
+  v <- sapply(1:K, function(k) var(diff(lw, lag = k))); k <- 1:K
+  f <- function(a) { sp <- exp(a[1]); sc <- exp(a[2]); ph <- plogis(a[3])
+    sum((log(k * sp + 2 * sc * (1 - ph^k)) - log(v))^2) }
+  o <- optim(c(log(v[1] / 2), log(v[1]), 2), f, method = "Nelder-Mead", control = list(maxit = 5000))
+  sp <- exp(o$par[1]); sc <- exp(o$par[2]); ph <- plogis(o$par[3])
+  list(k = k, obs = v, ajuste = k * sp + 2 * sc * (1 - ph^k), phi = ph, vida = log(0.5) / log(ph))
+}
+vr_total <- ajuste_vr(lw)
+vr_36 <- ajuste_vr(lw, 36)
+vr_sin_covid <- ajuste_vr(lw[names(lw) >= "2021-01"])
+h_cal <- round(vr_total$vida)
+
+plot_ly(height = 420) %>%
+  add_markers(x = vr_total$k, y = vr_total$obs / (vr_total$k * vr_total$obs[1]), name = "Observada",
+              marker = list(color = "#111827", size = 8), hovertemplate = "k = %{x}: %{y:.2f}") %>%
+  add_lines(x = vr_total$k, y = vr_total$ajuste / (vr_total$k * vr_total$obs[1]), name = "Modelo ajustado",
+            line = list(color = COL[["Logarítmico (MLA)"]], width = 3), hovertemplate = "k = %{x}: %{y:.2f}") %>%
+  add_lines(x = vr_total$k, y = rep(1, length(vr_total$k)), name = "Paseo aleatorio puro (= 1)",
+            line = list(color = "#9ca3af", dash = "dot"), hoverinfo = "skip") %>%
+  estilo_plotly("Razón de varianzas del WTI: los choques se disipan en parte", "Horizonte k (meses)",
+                "Var(k) / (k · Var(1))")
+
+kable(data.frame(Muestra = c("2019–2026, k ≤ 24 (base)", "2019–2026, k ≤ 36", "2021–2026, sin COVID"),
+                 phi = round(c(vr_total$phi, vr_36$phi, vr_sin_covid$phi), 3),
+                 `Vida media (meses)` = round(c(vr_total$vida, vr_36$vida, vr_sin_covid$vida), 1),
+                 check.names = FALSE),
+      caption = "Vida media del componente transitorio del WTI")
+```
+
+Si el WTI fuera un paseo aleatorio puro, la razón de varianzas sería 1 en todos los horizontes; en
+la serie cae hasta `r vv(fmt(tail(vr_total$obs / (vr_total$k * vr_total$obs[1]), 1)))` a 24 meses: una
+parte importante de cada choque se revierte. La vida media estimada es
+`r vv(fmt(vr_total$vida, 1))` meses (entre `r vv(fmt(min(vr_total$vida, vr_36$vida, vr_sin_covid$vida), 1))`
+y `r vv(fmt(max(vr_total$vida, vr_36$vida, vr_sin_covid$vida), 1))` según la muestra), así que se
+calibra **h = `r vv(h_cal)` meses**. La serie es corta (unos 90 meses) y el intervalo es amplio:
+conviene reestimar h cada año.
+
+## Escala θ: tamaño de los excesos históricos
+
+θ marca el exceso a partir del cual el consumidor recibe menos de la mitad del alza adicional.
+Se calibra para que los movimientos habituales pasen casi completos y solo se compriman los
+extremos: θ es el percentil `r params$theta_percentil * 100` de los excesos positivos
+$X_n = \ln(P_n/R_n)$ observados con la h calibrada.
+
+```{r cal-theta, eval = hay_base}
+exceso <- function(P, h) {
+  w <- 1 - 0.5^(1 / h); l <- log(P); R <- l
+  for (i in 2:length(l)) R[i] <- R[i - 1] + w * (l[i] - R[i - 1])
+  l - R
+}
+P_ok <- P_cal[!is.na(P_cal)]
+X_hist <- exceso(P_ok, h_cal)
+theta_cal <- round(unname(quantile(X_hist[X_hist > 0], params$theta_percentil)), 2)
+
+plot_ly(height = 400) %>%
+  add_histogram(x = X_hist * 100, nbinsx = 30, name = "Meses",
+                marker = list(color = COL[["Logarítmico (MLA)"]], line = list(color = "white", width = 1)),
+                hovertemplate = "Exceso %{x} %: %{y} meses<extra></extra>") %>%
+  estilo_plotly("Distribución del exceso de la paridad sobre su referencia, 2019–2026",
+                "Exceso X (%, en logaritmos)", "Meses", hover = "closest") %>%
+  layout(shapes = list(list(type = "line", xref = "x", yref = "paper", x0 = theta_cal * 100,
+                            x1 = theta_cal * 100, y0 = 0, y1 = 1,
+                            line = list(color = COL[["Banda DE 126"]], dash = "dash", width = 2))),
+         annotations = list(list(x = theta_cal * 100, y = 1, xref = "x", yref = "paper",
+                                 text = paste0("θ = ", fmt(theta_cal)), showarrow = FALSE,
+                                 xanchor = "left", yanchor = "top",
+                                 font = list(color = COL[["Banda DE 126"]], size = 11))),
+         showlegend = FALSE)
+```
+
+Con h = `r vv(h_cal)`, el percentil `r params$theta_percentil * 100` del exceso positivo es
+**θ = `r vv(fmt(theta_cal))`**: un exceso de `r vv(fmt(100 * expm1(theta_cal), 0))` % sobre la
+referencia todavía se traslada con un traspaso marginal del 50 %. Solo los choques del decil
+superior se comprimen con fuerza.
+
+## Fatiga κ: alza máxima tolerable en 12 meses
+
+κ es una decisión de política: fija cuánto puede subir como máximo el precio en un año si las alzas
+se encadenan. El peor caso del MLA en 12 meses es $e^{\sum_{m=0}^{11} c_\uparrow/(1+\kappa\ln(1+m))} - 1$;
+el de la banda es $1{,}05^{12} - 1 = 79{,}6\,\%$. Se calibra κ para que el peor caso del MLA sea
+`r fmt(params$fraccion_peor_banda * 100, 0)` % del de la banda.
+
+```{r cal-kappa, eval = hay_base}
+peor12 <- function(k) expm1(sum(p$c_up / (1 + k * log1p(0:11))))
+peor_banda <- (1 + p$lim_sup)^12 - 1
+objetivo_12 <- params$fraccion_peor_banda * peor_banda
+kappa_cal <- round(uniroot(function(k) peor12(k) - objetivo_12, c(0, 50))$root, 2)
+ks <- seq(0, 1.5, by = 0.01)
+
+plot_ly(height = 400) %>%
+  add_lines(x = ks, y = sapply(ks, peor12) * 100, name = "Peor alza en 12 meses del MLA",
+            line = list(color = COL[["Logarítmico (MLA)"]], width = 3),
+            hovertemplate = "κ = %{x:.2f}: +%{y:.1f} %<extra></extra>") %>%
+  add_markers(x = kappa_cal, y = peor12(kappa_cal) * 100, name = "κ calibrado",
+              marker = list(color = COL[["Banda DE 126"]], size = 12, symbol = "diamond"),
+              hovertemplate = "κ = %{x:.2f}: +%{y:.1f} %<extra></extra>") %>%
+  estilo_plotly("Peor alza posible en 12 meses según κ (c↑ = 4 %)", "κ", "%", hover = "closest") %>%
+  layout(shapes = list(linea_h(peor_banda * 100, COL[["Banda DE 126"]], "dash"),
+                       linea_h(objetivo_12 * 100, "#64748b", "dot")),
+         annotations = list(
+           list(x = 1, xref = "paper", y = peor_banda * 100, text = "Banda DE 126: +79,6 %",
+                showarrow = FALSE, xanchor = "right", yanchor = "bottom",
+                font = list(size = 10, color = COL[["Banda DE 126"]])),
+           list(x = 1, xref = "paper", y = objetivo_12 * 100,
+                text = paste0("Objetivo: +", fmt(objetivo_12 * 100, 1), " %"), showarrow = FALSE,
+                xanchor = "right", yanchor = "bottom", font = list(size = 10, color = "#64748b"))))
+```
+
+El objetivo de +`r vv(fmt(objetivo_12 * 100, 1))` % en 12 meses se alcanza con
+**κ = `r vv(fmt(kappa_cal))`**.
+
+## Parámetros calibrados
+
+```{r cal-tabla, eval = hay_base}
+kable(data.frame(
+  Parámetro = c("h, vida media de la referencia", "θ, compresión de alzas", "κ, fatiga",
+                "λ, velocidad de ajuste", "c↑ / c↓, techos suaves"),
+  `Valor base del documento` = c(p$h, fmt(p$theta), fmt(p$kappa), fmt(p$lambda),
+                                 paste0(p$c_up * 100, " % / ", p$c_down * 100, " %")),
+  `Valor calibrado` = c(h_cal, fmt(theta_cal), fmt(kappa_cal), fmt(p$lambda),
+                        paste0(p$c_up * 100, " % / ", p$c_down * 100, " %")),
+  Criterio = c("Vida media del componente transitorio del WTI (razones de varianza)",
+               paste0("Percentil ", params$theta_percentil * 100, " del exceso positivo histórico"),
+               paste0("Peor alza en 12 meses = ", params$fraccion_peor_banda * 100, " % del de la banda"),
+               "Se mantiene (decisión de política: fracción de la brecha que se cierra por mes)",
+               "Se mantienen (decisión de política)"),
+  check.names = FALSE))
+```
+
+## Resultados con la serie real
+
+Contrafactual desde abril de 2019, partiendo de la paridad: cómo habría evolucionado el PT si cada
+regla hubiera estado vigente durante COVID, la guerra Rusia–Ucrania y el conflicto EE. UU.–Irán.
+
+```{r cal-contrafactual, eval = hay_base}
+i0 <- which(meses_c == "2019-04")
+icf <- i0:length(meses_c)
+P_cf <- P_cal[icf]; pt0_cf <- P_cal[[i0 - 1]]
+cf <- list(
+  `Banda DE 126` = banda_de126(P_cf, pt0_cf, p$lim_sup, p$lim_inf, p$precio_base),
+  `Vigente DE 444/468` = vigente_444(P_cf, pt0_cf, p$lim_sup, p$lim_inf, p$precio_base, p$una_sola_vez),
+  `MLA (valores base)` = mla(P_cf, pt0_cf, p$h, p$theta, p$theta_baja, p$lambda, p$c_up, p$c_down,
+                             p$kappa, p$coherencia, p$precio_base),
+  `MLA calibrado` = mla(P_cf, pt0_cf, h_cal, theta_cal, p$theta_baja, p$lambda, p$c_up, p$c_down,
+                        kappa_cal, p$coherencia, p$precio_base))
+COL_CF <- c(COL, `MLA (valores base)` = "#86efac", `MLA calibrado` = COL[["Logarítmico (MLA)"]])
+EST_CF <- c(ESTILO_LINEA, list(`MLA (valores base)` = list(dash = "dash", width = 2),
+                               `MLA calibrado` = list(dash = "solid", width = 3.5)))
+f_cf <- fechas_c[icf]
+
+pl <- plot_ly(height = 520) %>%
+  add_lines(x = f_cf, y = P_cf, name = "Paridad", line = list(color = COL[["Paridad"]], dash = "dot", width = 2),
+            hovertemplate = "%{y:.4f}")
+for (k in names(cf)) {
+  pl <- pl %>% add_lines(x = f_cf, y = cf[[k]]$pt, name = k, text = cf[[k]]$tramo,
+                         visible = if (k == "MLA (valores base)") "legendonly" else TRUE,
+                         line = c(list(color = COL_CF[[k]]), EST_CF[[k]]),
+                         hovertemplate = "%{y:.4f} · %{text}")
+}
+sb_cf <- sombra_eventos()
+pl %>%
+  estilo_plotly("Contrafactual 2019–2026: PT de cada regla con la paridad real", NULL,
+                "USD/gal sin IVA", leyenda = "arriba") %>%
+  layout(xaxis = list(rangeslider = list(visible = TRUE, thickness = 0.07),
+                      tickformat = "%b %Y", hoverformat = "%b %Y"),
+         shapes = c(sb_cf$shapes, list(linea_h(p$precio_base))), annotations = sb_cf$annotations)
+```
+
+```{r cal-ventanas, eval = hay_base}
+ventanas <- list(`Total 2019–2026` = c("2019-04", tail(meses_c, 1)),
+                 `COVID` = c("2020-01", "2021-12"),
+                 `Rusia–Ucrania` = c("2022-01", "2023-10"),
+                 `EE. UU.–Irán` = c("2026-03", tail(meses_c, 1)))
+mc <- meses_c[icf]
+tabla_cf <- do.call(rbind, lapply(names(ventanas), function(v) {
+  sel <- mc >= ventanas[[v]][1] & mc <= ventanas[[v]][2]
+  do.call(rbind, lapply(names(cf), function(k) {
+    df <- cf[[k]][sel, ]; m <- metricas(df)
+    data.frame(Ventana = v, Regla = k,
+               `Volatilidad (pp)` = round(m[["Volatilidad mensual (pp)"]], 2),
+               `Alza máx. 12 m (%)` = round(alza_ventana12(df$pt), 1),
+               `Meses al tope` = m[["Meses al alza ≥ 4,9 %"]],
+               `Meses contra-dirección` = m[["Meses contra-dirección"]],
+               `Brecha acumulada` = round(m[["Brecha acumulada (USD/gal·mes)"]], 2),
+               `Sobreprecio acumulado` = round(m[["Sobreprecio acumulado (USD/gal·mes)"]], 2),
+               check.names = FALSE)
+  }))
+}))
+kable(tabla_cf, row.names = FALSE,
+      caption = "Indicadores del contrafactual por episodio (brecha y sobreprecio en USD/gal·mes)")
+```
+
+```{r cal-ventana-real, eval = hay_base}
+pt0_v <- 2.80 / (1 + p$iva) - p$mgc
+real_v <- list(
+  `Banda DE 126` = val_b, `Vigente DE 444/468` = val_v,
+  `MLA calibrado` = mla(P_cal[iv], pt0_v, h_cal, theta_cal, p$theta_baja, p$lambda, p$c_up, p$c_down,
+                        kappa_cal, p$coherencia, p$precio_base))
+kable(data.frame(Período = meses_c[iv], `PVP observado` = round(pvp_obs[iv], 3),
+                 `Paridad (PVP)` = round(P_pvp[iv], 3),
+                 sapply(real_v, function(df) pvp(df$pt)), check.names = FALSE, row.names = NULL),
+      caption = "PVP (USD/gal con IVA) en la ventana real desde nov-2025, con cada regla")
+```
+
+## Sensibilidad de la calibración
+
+Brecha acumulada y volatilidad del contrafactual 2019–2026 alrededor de los valores calibrados
+(κ fijo en `r vv(fmt(kappa_cal))`). Sirve para ver cuánto cambia el costo si h o θ se eligen
+distinto.
+
+```{r cal-sensibilidad, eval = hay_base}
+hs_s <- sort(unique(c(4, 6, h_cal, 9, 12)))
+ths_s <- sort(unique(c(0.2, 0.3, theta_cal, 0.5)))
+celda <- function(hh, th) {
+  m <- metricas(mla(P_cf, pt0_cf, hh, th, p$theta_baja, p$lambda, p$c_up, p$c_down, kappa_cal,
+                    p$coherencia, p$precio_base))
+  sprintf("%s / %s", fmt(m[["Brecha acumulada (USD/gal·mes)"]], 1), fmt(m[["Volatilidad mensual (pp)"]], 2))
+}
+sens <- outer(hs_s, ths_s, Vectorize(celda))
+dimnames(sens) <- list(paste("h =", hs_s), paste("θ =", fmt(ths_s)))
+kable(sens, caption = "Brecha acumulada (USD/gal·mes) / volatilidad mensual (pp) del MLA, 2019–2026")
+```
+
+La brecha cambia poco con h y θ (de `r vv(fmt(min(as.numeric(sub(",", ".", sub(" /.*", "", sens))), na.rm = TRUE), 1))`
+a `r vv(fmt(max(as.numeric(sub(",", ".", sub(" /.*", "", sens))), na.rm = TRUE), 1))` USD/gal·mes en
+toda la tabla). Lo que más pesa en el costo fiscal son los techos de velocidad: c↑ y κ. Por eso h y
+θ pueden fijarse con criterios estadísticos, y la discusión de política debe centrarse en c↑ y κ.
+
+```{r cal-resumen, include = FALSE, eval = hay_base}
+tot <- function(k, col) tabla_cf[tabla_cf$Ventana == "Total 2019–2026" & tabla_cf$Regla == k, col]
+iran <- function(k, col) tabla_cf[tabla_cf$Ventana == "EE. UU.–Irán" & tabla_cf$Regla == k, col]
+```
+
+**Lectura.** Con los parámetros calibrados (h = `r vv(h_cal)`, θ = `r vv(fmt(theta_cal))`,
+κ = `r vv(fmt(kappa_cal))`), en todo 2019–2026 la volatilidad mensual del PT pasa de
+`r vv(fmt(tot("Banda DE 126", "Volatilidad (pp)")))` pp con la banda a
+`r vv(fmt(tot("MLA calibrado", "Volatilidad (pp)")))` pp, y la brecha acumulada de
+`r vv(fmt(tot("Banda DE 126", "Brecha acumulada")))` a `r vv(fmt(tot("MLA calibrado", "Brecha acumulada")))`
+USD/gal·mes (la regla vigente: `r vv(fmt(tot("Vigente DE 444/468", "Brecha acumulada")))`). En el
+episodio EE. UU.–Irán, el alza máxima en 12 meses es de `r vv(fmt(iran("MLA calibrado", "Alza máx. 12 m (%)"), 1))` %
+con el MLA calibrado, frente a `r vv(fmt(iran("Banda DE 126", "Alza máx. 12 m (%)"), 1))` % con la banda
+y `r vv(fmt(iran("Vigente DE 444/468", "Alza máx. 12 m (%)"), 1))` % con la regla vigente.
+
+# Aplicación a datos reales
+
+```{r datos-reales, eval = nzchar(params$archivo_datos)}
+arch <- params$archivo_datos
+crudo <- if (grepl("\\.xlsx?$", arch, ignore.case = TRUE)) {
+  if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl", repos = "https://cloud.r-project.org")
+  as.data.frame(readxl::read_excel(arch))
+} else read.csv(arch, check.names = FALSE)
+f <- as.Date(crudo[[params$col_fecha]], tryFormats = c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"))
+v <- suppressWarnings(as.numeric(crudo[[params$col_valor]]))
+ok <- !is.na(f) & !is.na(v)
+mens <- aggregate(v[ok], list(mes = format(f[ok], "%Y-%m")), mean)
+P_real <- if (params$tipo_valor == "wti") paridad_desde_wti(mens$x, p$S, p$rezago, p$elasticidad) else mens$x
+r_real <- correr_todo(P_real, pt0)
+f_real <- as.Date(paste0(mens$mes, "-12"))
+grafico_trayectorias(list(P = P_real, res = r_real), f_real, "Serie real",
+                     wti = if (params$tipo_valor == "wti") mens$x else NULL)
+kable(round(sapply(r_real, metricas), 2), caption = "Indicadores con la serie real")
+if (isTRUE(params$exportar_csv)) {
+  salida <- data.frame(periodo = mens$mes, paridad = P_real,
+                       sapply(r_real, `[[`, "pt"), check.names = FALSE)
+  write.csv(salida, "resultados_MLA_serie_real.csv", row.names = FALSE)
+}
+```
+
+`r if (!nzchar(params$archivo_datos)) "*No se indicó archivo de datos.* Para aplicar el análisis a la serie real, renderice con, por ejemplo:\n\n    rmarkdown::render(\"Propuesta_MLA_diesel.Rmd\", params = list(archivo_datos = \"BASE_FINAL_WTI_BRENT.xlsx\", col_fecha = \"Fecha\", col_valor = \"WTI\"))\n\nEl archivo puede ser diario o mensual; se promedia por mes."`
+
+# Conclusiones y limitaciones
+
+**Conclusiones.**
+
+- En todos los escenarios sintéticos el MLA reduce la volatilidad mensual del PT y el alza máxima
+  en 12 meses frente a la banda del DE 126, y nunca produce meses al tope.
+- Ante alzas prolongadas el precio sube cada vez menos, de forma logarítmica, cumpliendo el objetivo
+  de no ser explosivo.
+- La coherencia direccional elimina sin umbrales el problema que corrige el DE 444.
+- La fórmula usa pocos parámetros, todos con lectura económica directa.
+- Con la serie real 2019–2026 (sección 12), los parámetros calibrados son h = `r vv(h_cal)`,
+  θ = `r vv(fmt(theta_cal))` y κ = `r vv(fmt(kappa_cal))`. El MLA calibrado reduce la volatilidad
+  mensual del PT de `r vv(fmt(tot("Banda DE 126", "Volatilidad (pp)")))` a
+  `r vv(fmt(tot("MLA calibrado", "Volatilidad (pp)")))` pp y los meses al tope de
+  `r vv(tot("Banda DE 126", "Meses al tope"))` a `r vv(tot("MLA calibrado", "Meses al tope"))` (el
+  salto inicial al precio base, común a todas las reglas), a cambio de duplicar la brecha
+  acumulada frente a la banda.
+- Ante choques geopolíticos, la regla vigente (DE 444/468) solo actúa en un patrón concreto y,
+  una vez activa, puede bajar el precio mientras la paridad sube. El MLA responde de forma
+  gradual a cualquier forma de choque sin umbrales.
+
+**Limitaciones.**
+
+- **Costo fiscal.** Suavizar genera una brecha temporal con la paridad, mayor que la de la banda
+  cuando el alza es sostenida. Debe dimensionarse con los volúmenes de despacho y respaldarse en el
+  presupuesto o con la variante simétrica (fondo de estabilización).
+- **Paridad aproximada.** La paridad desde el WTI es una aproximación (elasticidad constante,
+  sin variaciones del crack spread ni del flete) que reproduce el PVP observado con un error de
+  unos 5 centavos por galón. Para la decisión final, la calibración debe repetirse con el PPI de
+  la ARCH o con los marcadores Argus.
+- **Serie corta.** La vida media h se estima con unos 90 meses; el rango entre muestras es amplio
+  y conviene reestimarla cada año.
+- **Implementación normativa.** Requiere reformar el num. 2.1.3 del Reglamento por Decreto
+  Ejecutivo, con informe técnico y jurídico del MAE, resolución del COENER y dictamen del MEF.
